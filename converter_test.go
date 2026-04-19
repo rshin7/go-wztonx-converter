@@ -227,8 +227,9 @@ func TestRGB565Conversion(t *testing.T) {
 }
 
 func TestARGB8888Conversion(t *testing.T) {
-	// Test converting ARGB8888 (BGRA in WZ) to RGBA
-	data := []byte{0xFF, 0x00, 0x00, 0x80} // Blue pixel with alpha
+	// Test converting ARGB8888 (BGRA in WZ) — should pass through unchanged
+	// because the NX format stores BGRA and the C++ client handles the swap.
+	data := []byte{0xFF, 0x00, 0x00, 0x80} // B=FF, G=00, R=00, A=80
 	output, err := convertARGB8888(data, 1, 1)
 
 	if err != nil {
@@ -236,12 +237,12 @@ func TestARGB8888Conversion(t *testing.T) {
 	}
 
 	if len(output) != 4 {
-		t.Errorf("Expected 4 bytes (RGBA), got %d", len(output))
+		t.Errorf("Expected 4 bytes (BGRA), got %d", len(output))
 	}
 
-	// Check color channel swap (BGRA -> RGBA)
-	if output[0] != 0x00 || output[1] != 0x00 || output[2] != 0xFF || output[3] != 0x80 {
-		t.Errorf("Color channels not swapped correctly: R=%d, G=%d, B=%d, A=%d",
+	// BGRA pass-through: output should be identical to input
+	if output[0] != 0xFF || output[1] != 0x00 || output[2] != 0x00 || output[3] != 0x80 {
+		t.Errorf("BGRA pass-through failed: B=%d, G=%d, R=%d, A=%d",
 			output[0], output[1], output[2], output[3])
 	}
 }
@@ -373,6 +374,35 @@ func TestParallelCompressionWithAlreadyCompressed(t *testing.T) {
 }
 
 // Helper for testing - a seekable buffer
+// writeNXDataToBytes is a test helper that writes NX data to a temp file
+// and returns the resulting bytes.
+func writeNXDataToBytes(t *testing.T, converter *Converter) []byte {
+	t.Helper()
+	tmpFile, err := os.CreateTemp("", "nxtest_*.nx")
+	if err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+
+	bs := newBufferedSeeker(tmpFile, 1024*1024)
+	if err := converter.writeNXData(bs); err != nil {
+		tmpFile.Close()
+		t.Fatalf("Failed to write NX data: %v", err)
+	}
+	if err := bs.Flush(); err != nil {
+		tmpFile.Close()
+		t.Fatalf("Failed to flush: %v", err)
+	}
+	tmpFile.Close()
+
+	data, err := os.ReadFile(tmpPath)
+	if err != nil {
+		t.Fatalf("Failed to read temp file: %v", err)
+	}
+	return data
+}
+
 type seekableBuffer struct {
 	buf    []byte
 	pos    int64
@@ -515,19 +545,15 @@ func TestNXFileFormat(t *testing.T) {
 	// Flatten nodes
 	converter.flattenNodes(root)
 
-	// Write to buffer
-	buf := newSeekableBuffer()
-	err := converter.writeNXData(buf)
-	if err != nil {
-		t.Fatalf("Failed to write NX data: %v", err)
-	}
+	// Write to temp file and get bytes
+	data := writeNXDataToBytes(t, converter)
 
 	// Validate header
-	reader := bytes.NewReader(buf.Bytes())
+	reader := bytes.NewReader(data)
 
 	// Check magic
 	magic := make([]byte, 4)
-	_, err = io.ReadFull(reader, magic)
+	_, err := io.ReadFull(reader, magic)
 	if err != nil {
 		t.Fatalf("Failed to read magic: %v", err)
 	}
@@ -678,15 +704,11 @@ func TestNXFileFormatReading(t *testing.T) {
 
 	converter.flattenNodes(root)
 
-	// Write to buffer
-	buf := newSeekableBuffer()
-	err := converter.writeNXData(buf)
-	if err != nil {
-		t.Fatalf("Failed to write NX data: %v", err)
-	}
+	// Write to temp file and get bytes
+	data := writeNXDataToBytes(t, converter)
 
 	// Now read back like gonx does
-	reader := bytes.NewReader(buf.Bytes())
+	reader := bytes.NewReader(data)
 
 	// Read header
 	var header struct {
@@ -701,7 +723,7 @@ func TestNXFileFormatReading(t *testing.T) {
 		AudioOffsetTableOffset  int64
 	}
 
-	err = binary.Read(reader, binary.LittleEndian, &header)
+	err := binary.Read(reader, binary.LittleEndian, &header)
 	if err != nil {
 		t.Fatalf("Failed to read header: %v", err)
 	}
@@ -714,7 +736,7 @@ func TestNXFileFormatReading(t *testing.T) {
 
 	t.Logf("Header values:")
 	t.Logf("  String count: %d, offset table offset: %d", header.StringCount, header.StringOffsetTableOffset)
-	t.Logf("  Buffer size: %d", len(buf.Bytes()))
+	t.Logf("  Buffer size: %d", len(data))
 	t.Logf("  Converter strings: %d", len(converter.strings))
 	if string(header.Magic[:]) != "PKG4" {
 		t.Errorf("Invalid magic: %s", string(header.Magic[:]))
@@ -767,35 +789,29 @@ func TestNXFileFormatReading(t *testing.T) {
 	}
 
 	// Read bitmaps using offset table
+	// NX format: bitmap data is [uint32 compressed_size][LZ4 compressed data]
+	// Width/height come from the node data, not the bitmap data section.
 	for i, offset := range bitmapOffsets {
 		_, err = reader.Seek(offset, 0)
 		if err != nil {
 			t.Fatalf("Failed to seek to bitmap %d: %v", i, err)
 		}
 
-		var width, height uint16
-		var size uint32
-		if err := binary.Read(reader, binary.LittleEndian, &width); err != nil {
-			t.Fatalf("Failed to read bitmap width: %v", err)
-		}
-		if err := binary.Read(reader, binary.LittleEndian, &height); err != nil {
-			t.Fatalf("Failed to read bitmap height: %v", err)
-		}
-		if err := binary.Read(reader, binary.LittleEndian, &size); err != nil {
-			t.Fatalf("Failed to read bitmap size: %v", err)
+		var compressedSize uint32
+		if err := binary.Read(reader, binary.LittleEndian, &compressedSize); err != nil {
+			t.Fatalf("Failed to read bitmap compressed size: %v", err)
 		}
 
-		bitmapData := make([]byte, size)
+		bitmapData := make([]byte, compressedSize)
 		_, err = reader.Read(bitmapData)
 		if err != nil {
 			t.Fatalf("Failed to read bitmap data: %v", err)
 		}
 
-		t.Logf("Bitmap %d: %dx%d, %d bytes", i, width, height, size)
+		t.Logf("Bitmap %d: compressed %d bytes", i, compressedSize)
 
-		// Validate bitmap data
-		if width != 5 || height != 10 {
-			t.Errorf("Bitmap dimensions mismatch: got %dx%d, want 5x10", width, height)
+		if compressedSize == 0 {
+			t.Errorf("Bitmap %d has zero compressed size", i)
 		}
 	}
 

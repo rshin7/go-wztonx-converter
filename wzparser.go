@@ -203,9 +203,8 @@ func (c *Converter) traverseWZObject(obj interface{}, parentNode *Node) {
 	}
 }
 
-// traverseWZCanvas processes a Canvas (bitmap image)
+// traverseWZCanvas processes a Canvas (bitmap image).
 func (c *Converter) traverseWZCanvas(canvas *wz.WZCanvas, parentNode *Node) {
-	// Process canvas properties first
 	if canvas.Properties != nil {
 		for _, name := range canvas.Properties.Order {
 			prop := canvas.Properties.Properties[name]
@@ -213,9 +212,7 @@ func (c *Converter) traverseWZCanvas(canvas *wz.WZCanvas, parentNode *Node) {
 		}
 	}
 
-	// If in client mode, handle bitmap data
 	if c.client && canvas.Width > 0 && canvas.Height > 0 {
-		bitmapID := uint32(len(c.bitmaps))
 		width := uint16(canvas.Width)
 		height := uint16(canvas.Height)
 
@@ -224,7 +221,12 @@ func (c *Converter) traverseWZCanvas(canvas *wz.WZCanvas, parentNode *Node) {
 			Height: height,
 			Data:   c.extractCanvasData(canvas),
 		}
+
+		// Lock to safely assign bitmap ID and append to shared slice.
+		c.mu.Lock()
+		bitmapID := uint32(len(c.bitmaps))
 		c.bitmaps = append(c.bitmaps, bitmap)
+		c.mu.Unlock()
 
 		parentNode.Type = NodeTypeBitmap
 		parentNode.Data = BitmapNodeData{
@@ -257,13 +259,10 @@ func (c *Converter) extractCanvasData(canvas *wz.WZCanvas) []byte {
 	return processedData
 }
 
-// traverseWZSound processes a Sound object
+// traverseWZSound processes a Sound object.
 func (c *Converter) traverseWZSound(sound *wz.WZSoundDX8, parentNode *Node) {
-	audioID := uint32(len(c.audio))
-
-	// NX audio entries must include the 82-byte WZ header before the actual
-	// sound data, because readers (e.g. the WASM client) skip the first 82
-	// bytes to reach the playable MP3/WAV payload.
+	// NX audio entries: 82-byte WZ header + actual sound data.
+	// Readers skip the first 82 bytes to reach the playable MP3/WAV payload.
 	soundData := append(sound.HeaderData, sound.SoundData...)
 	length := uint32(len(soundData))
 
@@ -271,7 +270,12 @@ func (c *Converter) traverseWZSound(sound *wz.WZSoundDX8, parentNode *Node) {
 		Length: length,
 		Data:   soundData,
 	}
+
+	// Lock to safely assign audio ID and append to shared slice.
+	c.mu.Lock()
+	audioID := uint32(len(c.audio))
 	c.audio = append(c.audio, audio)
+	c.mu.Unlock()
 
 	parentNode.Type = NodeTypeAudio
 	parentNode.Data = AudioNodeData{

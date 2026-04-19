@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
 	"runtime"
 	"sort"
@@ -38,10 +39,13 @@ type Converter struct {
 
 	// NX data structures
 	nodes     []*Node
+	nodeIndex map[*Node]uint32
 	strings   []string
 	stringMap map[string]uint32
 	bitmaps   []BitmapData
 	audio     []AudioData
+
+	mu sync.Mutex // protects bitmaps, audio, strings during parallel parsing
 
 	// Debug logging
 	debugLog *log.Logger
@@ -125,6 +129,19 @@ func (bs *bufferedSeeker) Close() error {
 		return err
 	}
 	return bs.file.Close()
+}
+
+// posTracker wraps an io.Writer and tracks the current write position,
+// avoiding costly Seek(0, SeekCurrent) calls that would flush the buffer.
+type posTracker struct {
+	w   io.Writer
+	pos uint64
+}
+
+func (p *posTracker) Write(data []byte) (int, error) {
+	n, err := p.w.Write(data)
+	p.pos += uint64(n)
+	return n, err
 }
 
 // NewConverter creates a new converter instance
@@ -211,38 +228,29 @@ func (c *Converter) writeNXFile() error {
 }
 
 // writeNXData writes the actual NX format data
-func (c *Converter) writeNXData(w io.Writer) error {
-	// We need to use a seekable writer to update the header later
-	// Cast to io.WriteSeeker
-	seeker, ok := w.(io.WriteSeeker)
-	if !ok {
-		return fmt.Errorf("writer must support seeking")
-	}
+func (c *Converter) writeNXData(bs *bufferedSeeker) error {
+	pt := &posTracker{w: bs, pos: 0}
 
-	// Write placeholder header
 	fmt.Print("  Writing header...")
-	if err := c.writeHeader(w); err != nil {
+	if err := c.writeHeader(pt); err != nil {
 		return err
 	}
 	fmt.Println("Done!")
 
-	// Write nodes
+	nodeOffset := pt.pos
 	fmt.Printf("  Writing %d nodes...\n", len(c.nodes))
-	nodeOffset := uint64(52) // Header size
-	if err := c.writeNodes(w); err != nil {
+	if err := c.writeNodes(pt); err != nil {
 		return err
 	}
 	fmt.Println("  Done!")
 
-	// Write string data and offset table
 	fmt.Printf("  Writing %d strings...", len(c.strings))
-	stringOffsetTableOffset, err := c.writeStrings(w)
+	stringOffsetTableOffset, err := c.writeStrings(pt)
 	if err != nil {
 		return err
 	}
 	fmt.Println("Done!")
 
-	// Write bitmaps and audio if in client mode
 	var bitmapOffsetTableOffset uint64
 	var audioOffsetTableOffset uint64
 
@@ -255,7 +263,7 @@ func (c *Converter) writeNXData(w io.Writer) error {
 			fmt.Println("Done!")
 
 			fmt.Print("  Writing bitmaps...")
-			bitmapOffsetTableOffset, err = c.writeBitmaps(w)
+			bitmapOffsetTableOffset, err = c.writeBitmaps(pt)
 			if err != nil {
 				return err
 			}
@@ -264,7 +272,7 @@ func (c *Converter) writeNXData(w io.Writer) error {
 
 		if len(c.audio) > 0 {
 			fmt.Printf("  Writing %d audio files...", len(c.audio))
-			audioOffsetTableOffset, err = c.writeAudio(w)
+			audioOffsetTableOffset, err = c.writeAudio(pt)
 			if err != nil {
 				return err
 			}
@@ -272,9 +280,11 @@ func (c *Converter) writeNXData(w io.Writer) error {
 		}
 	}
 
-	// Update header with actual offsets
 	fmt.Print("  Finalizing header...")
-	if err := c.updateHeader(seeker, nodeOffset, stringOffsetTableOffset, bitmapOffsetTableOffset, audioOffsetTableOffset); err != nil {
+	if err := bs.Flush(); err != nil {
+		return err
+	}
+	if err := c.updateHeader(bs, nodeOffset, stringOffsetTableOffset, bitmapOffsetTableOffset, audioOffsetTableOffset); err != nil {
 		return err
 	}
 	fmt.Println("Done!")
@@ -282,102 +292,40 @@ func (c *Converter) writeNXData(w io.Writer) error {
 	return nil
 }
 
-// writeHeader writes the NX file header (placeholder values initially)
+// writeHeader writes a 52-byte placeholder header (updated at the end).
 func (c *Converter) writeHeader(w io.Writer) error {
-	// NX Header:
-	// 4 bytes: magic "PKG4"
-	// 4 bytes: node count
-	// 8 bytes: node offset (52 bytes from start)
-	// 4 bytes: string count
-	// 8 bytes: string offset table offset
-	// 4 bytes: bitmap count
-	// 8 bytes: bitmap offset table offset
-	// 4 bytes: audio count
-	// 8 bytes: audio offset table offset
-
-	// Write magic
-	if _, err := w.Write([]byte(NXMagic)); err != nil {
-		return err
-	}
-
-	// Write placeholder values (will be updated later)
-	if err := binary.Write(w, binary.LittleEndian, uint32(0)); err != nil { // node count
-		return err
-	}
-	if err := binary.Write(w, binary.LittleEndian, uint64(0)); err != nil { // node offset
-		return err
-	}
-	if err := binary.Write(w, binary.LittleEndian, uint32(0)); err != nil { // string count
-		return err
-	}
-	if err := binary.Write(w, binary.LittleEndian, uint64(0)); err != nil { // string offset table offset
-		return err
-	}
-	if err := binary.Write(w, binary.LittleEndian, uint32(0)); err != nil { // bitmap count
-		return err
-	}
-	if err := binary.Write(w, binary.LittleEndian, uint64(0)); err != nil { // bitmap offset table offset
-		return err
-	}
-	if err := binary.Write(w, binary.LittleEndian, uint32(0)); err != nil { // audio count
-		return err
-	}
-	if err := binary.Write(w, binary.LittleEndian, uint64(0)); err != nil { // audio offset table offset
-		return err
-	}
-
-	return nil
+	var buf [52]byte
+	copy(buf[0:4], NXMagic)
+	_, err := w.Write(buf[:])
+	return err
 }
 
-// writeNodes writes all nodes to the file
-// IMPORTANT: Does NOT sort nodes - preserves original order
+// writeNodes writes all nodes using O(1) child index lookups and direct byte encoding.
 func (c *Converter) writeNodes(w io.Writer) error {
-	// Node structure (20 bytes):
-	// 4 bytes: name string ID
-	// 4 bytes: first child index
-	// 2 bytes: child count
-	// 2 bytes: type
-	// 8 bytes: data (type-dependent)
-
 	totalNodes := len(c.nodes)
+	buf := make([]byte, 20)
 	var lastPercent int = -1
 
 	for i, node := range c.nodes {
 		nameID := c.getStringID(node.Name)
 
-		// Calculate child info
 		var firstChild uint32 = 0
 		var childCount uint16 = 0
 		if len(node.Children) > 0 {
-			// Find index of first child
-			for j, n := range c.nodes {
-				if n == node.Children[0] {
-					firstChild = uint32(j)
-					break
-				}
-			}
+			firstChild = c.nodeIndex[node.Children[0]]
 			childCount = uint16(len(node.Children))
 		}
 
-		if err := binary.Write(w, binary.LittleEndian, nameID); err != nil {
-			return err
-		}
-		if err := binary.Write(w, binary.LittleEndian, firstChild); err != nil {
-			return err
-		}
-		if err := binary.Write(w, binary.LittleEndian, childCount); err != nil {
-			return err
-		}
-		if err := binary.Write(w, binary.LittleEndian, node.Type); err != nil {
+		binary.LittleEndian.PutUint32(buf[0:4], nameID)
+		binary.LittleEndian.PutUint32(buf[4:8], firstChild)
+		binary.LittleEndian.PutUint16(buf[8:10], childCount)
+		binary.LittleEndian.PutUint16(buf[10:12], node.Type)
+		c.encodeNodeData(buf[12:20], node)
+
+		if _, err := w.Write(buf); err != nil {
 			return err
 		}
 
-		// Write data based on type
-		if err := c.writeNodeData(w, node); err != nil {
-			return err
-		}
-
-		// Update progress
 		percent := (i + 1) * 100 / totalNodes
 		if percent != lastPercent {
 			fmt.Printf("\r  Progress: %d%%", percent)
@@ -385,136 +333,98 @@ func (c *Converter) writeNodes(w io.Writer) error {
 		}
 	}
 
-	fmt.Println() // New line after progress
+	fmt.Println()
 	return nil
 }
 
-// writeNodeData writes type-specific node data
-func (c *Converter) writeNodeData(w io.Writer, node *Node) error {
-	var err error
+// encodeNodeData writes 8 bytes of type-specific data directly into buf.
+func (c *Converter) encodeNodeData(buf []byte, node *Node) {
+	_ = buf[7] // bounds check elimination hint
+	buf[0] = 0
+	buf[1] = 0
+	buf[2] = 0
+	buf[3] = 0
+	buf[4] = 0
+	buf[5] = 0
+	buf[6] = 0
+	buf[7] = 0
+
 	switch node.Type {
-	case NodeTypeNone:
-		err = binary.Write(w, binary.LittleEndian, uint64(0))
 	case NodeTypeInt64:
-		err = binary.Write(w, binary.LittleEndian, node.Data.(int64))
+		if v, ok := node.Data.(int64); ok {
+			binary.LittleEndian.PutUint64(buf, uint64(v))
+		}
 	case NodeTypeDouble:
-		err = binary.Write(w, binary.LittleEndian, node.Data.(float64))
+		if v, ok := node.Data.(float64); ok {
+			binary.LittleEndian.PutUint64(buf, math.Float64bits(v))
+		}
 	case NodeTypeString:
-		strID := c.getStringID(node.Data.(string))
-		if err = binary.Write(w, binary.LittleEndian, uint32(strID)); err != nil {
-			return err
+		if s, ok := node.Data.(string); ok {
+			binary.LittleEndian.PutUint32(buf[0:4], c.getStringID(s))
 		}
-		err = binary.Write(w, binary.LittleEndian, uint32(0)) // padding
 	case NodeTypePOINT:
-		point := node.Data.([2]int32)
-		if err = binary.Write(w, binary.LittleEndian, point[0]); err != nil {
-			return err
+		if p, ok := node.Data.([2]int32); ok {
+			binary.LittleEndian.PutUint32(buf[0:4], uint32(p[0]))
+			binary.LittleEndian.PutUint32(buf[4:8], uint32(p[1]))
 		}
-		err = binary.Write(w, binary.LittleEndian, point[1])
 	case NodeTypeBitmap:
-		bitmapData := node.Data.(BitmapNodeData)
-		if err = binary.Write(w, binary.LittleEndian, bitmapData.ID); err != nil {
-			return err
+		if b, ok := node.Data.(BitmapNodeData); ok {
+			binary.LittleEndian.PutUint32(buf[0:4], b.ID)
+			binary.LittleEndian.PutUint16(buf[4:6], b.Width)
+			binary.LittleEndian.PutUint16(buf[6:8], b.Height)
 		}
-		if err = binary.Write(w, binary.LittleEndian, bitmapData.Width); err != nil {
-			return err
-		}
-		err = binary.Write(w, binary.LittleEndian, bitmapData.Height)
 	case NodeTypeAudio:
-		audioData := node.Data.(AudioNodeData)
-		if err = binary.Write(w, binary.LittleEndian, audioData.ID); err != nil {
-			return err
+		if a, ok := node.Data.(AudioNodeData); ok {
+			binary.LittleEndian.PutUint32(buf[0:4], a.ID)
+			binary.LittleEndian.PutUint32(buf[4:8], a.Length)
 		}
-		err = binary.Write(w, binary.LittleEndian, audioData.Length)
-	default:
-		err = binary.Write(w, binary.LittleEndian, uint64(0))
 	}
+}
+
+// updateHeader rewrites the complete 52-byte header with final values.
+func (c *Converter) updateHeader(bs *bufferedSeeker, nodeOffset, stringOffsetTableOffset, bitmapOffsetTableOffset, audioOffsetTableOffset uint64) error {
+	if _, err := bs.file.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+
+	var buf [52]byte
+	copy(buf[0:4], NXMagic)
+	binary.LittleEndian.PutUint32(buf[4:8], uint32(len(c.nodes)))
+	binary.LittleEndian.PutUint64(buf[8:16], nodeOffset)
+	binary.LittleEndian.PutUint32(buf[16:20], uint32(len(c.strings)))
+	binary.LittleEndian.PutUint64(buf[20:28], stringOffsetTableOffset)
+	binary.LittleEndian.PutUint32(buf[28:32], uint32(len(c.bitmaps)))
+	binary.LittleEndian.PutUint64(buf[32:40], bitmapOffsetTableOffset)
+	binary.LittleEndian.PutUint32(buf[40:44], uint32(len(c.audio)))
+	binary.LittleEndian.PutUint64(buf[44:52], audioOffsetTableOffset)
+
+	_, err := bs.file.Write(buf[:])
 	return err
 }
 
-// updateHeader updates the header with final offset values
-func (c *Converter) updateHeader(w io.WriteSeeker, nodeOffset, stringOffsetTableOffset, bitmapOffsetTableOffset, audioOffsetTableOffset uint64) error {
-	// Seek to start of file (after magic)
-	if _, err := w.Seek(4, io.SeekStart); err != nil {
-		return err
-	}
-
-	nodeCount := uint32(len(c.nodes))
-	stringCount := uint32(len(c.strings))
-	bitmapCount := uint32(len(c.bitmaps))
-	audioCount := uint32(len(c.audio))
-
-	// Write actual values
-	if err := binary.Write(w, binary.LittleEndian, nodeCount); err != nil {
-		return err
-	}
-	if err := binary.Write(w, binary.LittleEndian, nodeOffset); err != nil {
-		return err
-	}
-	if err := binary.Write(w, binary.LittleEndian, stringCount); err != nil {
-		return err
-	}
-	if err := binary.Write(w, binary.LittleEndian, stringOffsetTableOffset); err != nil {
-		return err
-	}
-	if err := binary.Write(w, binary.LittleEndian, bitmapCount); err != nil {
-		return err
-	}
-	if err := binary.Write(w, binary.LittleEndian, bitmapOffsetTableOffset); err != nil {
-		return err
-	}
-	if err := binary.Write(w, binary.LittleEndian, audioCount); err != nil {
-		return err
-	}
-	if err := binary.Write(w, binary.LittleEndian, audioOffsetTableOffset); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// writeStrings writes the string data and offset table
-// Returns the offset to the offset table
-func (c *Converter) writeStrings(w io.Writer) (uint64, error) {
-	seeker, ok := w.(io.WriteSeeker)
-	if !ok {
-		return 0, fmt.Errorf("writer must support seeking")
-	}
-
-	// Store offsets for each string
+// writeStrings writes string data followed by the offset table.
+func (c *Converter) writeStrings(pt *posTracker) (uint64, error) {
 	stringOffsets := make([]uint64, len(c.strings))
 
-	// Write string data first
+	var lenbuf [2]byte
 	for i, str := range c.strings {
-		// Record current position as the string offset
-		pos, err := seeker.Seek(0, io.SeekCurrent)
-		if err != nil {
-			return 0, err
-		}
-		stringOffsets[i] = uint64(pos)
+		stringOffsets[i] = pt.pos
 
-		// String format:
-		// 2 bytes: length
-		// N bytes: UTF-8 string data
-		length := uint16(len(str))
-		if err := binary.Write(w, binary.LittleEndian, length); err != nil {
+		binary.LittleEndian.PutUint16(lenbuf[:], uint16(len(str)))
+		if _, err := pt.Write(lenbuf[:]); err != nil {
 			return 0, err
 		}
-		if _, err := w.Write([]byte(str)); err != nil {
+		if _, err := pt.Write([]byte(str)); err != nil {
 			return 0, err
 		}
 	}
 
-	// Get position for offset table
-	pos, err := seeker.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return 0, err
-	}
-	stringOffsetTableOffset := uint64(pos)
+	stringOffsetTableOffset := pt.pos
 
-	// Write offset table
+	var buf [8]byte
 	for _, offset := range stringOffsets {
-		if err := binary.Write(w, binary.LittleEndian, offset); err != nil {
+		binary.LittleEndian.PutUint64(buf[:], offset)
+		if _, err := pt.Write(buf[:]); err != nil {
 			return 0, err
 		}
 	}
@@ -522,49 +432,29 @@ func (c *Converter) writeStrings(w io.Writer) (uint64, error) {
 	return stringOffsetTableOffset, nil
 }
 
-// writeBitmaps writes bitmap data and offset table
-// Returns the offset to the offset table
-func (c *Converter) writeBitmaps(w io.Writer) (uint64, error) {
-	seeker, ok := w.(io.WriteSeeker)
-	if !ok {
-		return 0, fmt.Errorf("writer must support seeking")
-	}
-
-	// Store offsets for each bitmap
+// writeBitmaps writes bitmap data followed by the offset table.
+func (c *Converter) writeBitmaps(pt *posTracker) (uint64, error) {
 	bitmapOffsets := make([]uint64, len(c.bitmaps))
 
-	// Write bitmap data first
+	var sizebuf [4]byte
 	for i, bitmap := range c.bitmaps {
-		// Record current position as the bitmap offset
-		pos, err := seeker.Seek(0, io.SeekCurrent)
-		if err != nil {
-			return 0, err
-		}
-		bitmapOffsets[i] = uint64(pos)
+		bitmapOffsets[i] = pt.pos
 
-		// Bitmap format (matches NoLifeNx C++ reader expectation):
-		// 4 bytes: compressed data size
-		// N bytes: compressed data
-		// Width and height are stored in the node data field, not here.
-		if err := binary.Write(w, binary.LittleEndian, uint32(len(bitmap.CompressedData))); err != nil {
+		binary.LittleEndian.PutUint32(sizebuf[:], uint32(len(bitmap.CompressedData)))
+		if _, err := pt.Write(sizebuf[:]); err != nil {
 			return 0, err
 		}
-		// Write compressed data
-		if _, err := w.Write(bitmap.CompressedData); err != nil {
+		if _, err := pt.Write(bitmap.CompressedData); err != nil {
 			return 0, err
 		}
 	}
 
-	// Get position for offset table
-	pos, err := seeker.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return 0, err
-	}
-	bitmapOffsetTableOffset := uint64(pos)
+	bitmapOffsetTableOffset := pt.pos
 
-	// Write offset table
+	var buf [8]byte
 	for _, offset := range bitmapOffsets {
-		if err := binary.Write(w, binary.LittleEndian, offset); err != nil {
+		binary.LittleEndian.PutUint64(buf[:], offset)
+		if _, err := pt.Write(buf[:]); err != nil {
 			return 0, err
 		}
 	}
@@ -572,49 +462,29 @@ func (c *Converter) writeBitmaps(w io.Writer) (uint64, error) {
 	return bitmapOffsetTableOffset, nil
 }
 
-// writeAudio writes audio data and offset table
-// Returns the offset to the offset table
-func (c *Converter) writeAudio(w io.Writer) (uint64, error) {
-	seeker, ok := w.(io.WriteSeeker)
-	if !ok {
-		return 0, fmt.Errorf("writer must support seeking")
-	}
-
-	// Store offsets for each audio
+// writeAudio writes audio data followed by the offset table.
+func (c *Converter) writeAudio(pt *posTracker) (uint64, error) {
 	audioOffsets := make([]uint64, len(c.audio))
 
-	// Write audio data first
-	for i, audio := range c.audio {
-		// Record current position as the audio offset
-		pos, err := seeker.Seek(0, io.SeekCurrent)
-		if err != nil {
-			return 0, err
-		}
-		audioOffsets[i] = uint64(pos)
+	for i := range c.audio {
+		audioOffsets[i] = pt.pos
 
-		// Ensure we have compressed data
-		if len(audio.CompressedData) == 0 && len(audio.Data) > 0 {
-			// For audio, we typically don't compress further as it's already compressed
-			// But matching C++ behavior
-			c.audio[i].CompressedData = audio.Data
+		// Audio data is already in final form (82-byte header + audio payload)
+		if len(c.audio[i].CompressedData) == 0 && len(c.audio[i].Data) > 0 {
+			c.audio[i].CompressedData = c.audio[i].Data
 		}
 
-		// Write audio data directly (no length prefix in the data section)
-		if _, err := w.Write(c.audio[i].CompressedData); err != nil {
+		if _, err := pt.Write(c.audio[i].CompressedData); err != nil {
 			return 0, err
 		}
 	}
 
-	// Get position for offset table
-	pos, err := seeker.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return 0, err
-	}
-	audioOffsetTableOffset := uint64(pos)
+	audioOffsetTableOffset := pt.pos
 
-	// Write offset table
+	var buf [8]byte
 	for _, offset := range audioOffsets {
-		if err := binary.Write(w, binary.LittleEndian, offset); err != nil {
+		binary.LittleEndian.PutUint64(buf[:], offset)
+		if _, err := pt.Write(buf[:]); err != nil {
 			return 0, err
 		}
 	}
@@ -622,8 +492,11 @@ func (c *Converter) writeAudio(w io.Writer) (uint64, error) {
 	return audioOffsetTableOffset, nil
 }
 
-// addString adds a string to the string table and returns its ID
+// addString adds a string to the string table and returns its ID.
+// Thread-safe: protected by c.mu for use during parallel WZ parsing.
 func (c *Converter) addString(str string) uint32 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if id, exists := c.stringMap[str]; exists {
 		return id
 	}
@@ -633,26 +506,29 @@ func (c *Converter) addString(str string) uint32 {
 	return id
 }
 
-// getStringID returns the ID for a string
+// getStringID returns the ID for a string, adding it if absent.
 func (c *Converter) getStringID(str string) uint32 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if id, exists := c.stringMap[str]; exists {
 		return id
 	}
-	return c.addString(str)
+	id := uint32(len(c.strings))
+	c.strings = append(c.strings, str)
+	c.stringMap[str] = id
+	return id
 }
 
-// compressBitmapsParallel compresses all bitmap data in parallel
+// compressBitmapsParallel compresses all bitmap data in parallel.
+// Frees raw pixel data after compression to reduce memory usage.
 func (c *Converter) compressBitmapsParallel() error {
 	if len(c.bitmaps) == 0 {
 		return nil
 	}
 
-	// Create error channel and wait group
 	errChan := make(chan error, len(c.bitmaps))
 	var wg sync.WaitGroup
 
-	// Use more workers for better CPU utilization
-	// Use 2x CPU count or at least 16 workers for good parallelism
 	maxWorkers := runtime.NumCPU() * 2
 	if maxWorkers < 16 {
 		maxWorkers = 16
@@ -660,7 +536,6 @@ func (c *Converter) compressBitmapsParallel() error {
 	semaphore := make(chan struct{}, maxWorkers)
 
 	for i := range c.bitmaps {
-		// Skip if already compressed or no data
 		if len(c.bitmaps[i].CompressedData) > 0 || len(c.bitmaps[i].Data) == 0 {
 			continue
 		}
@@ -668,26 +543,22 @@ func (c *Converter) compressBitmapsParallel() error {
 		wg.Add(1)
 		go func(index int) {
 			defer wg.Done()
-
-			// Acquire semaphore
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
 
-			// Compress the bitmap data
 			compressed, err := c.compressData(c.bitmaps[index].Data)
 			if err != nil {
 				errChan <- fmt.Errorf("compressing bitmap %d: %w", index, err)
 				return
 			}
 			c.bitmaps[index].CompressedData = compressed
+			c.bitmaps[index].Data = nil // free raw pixels to reduce memory
 		}(i)
 	}
 
-	// Wait for all compressions to complete
 	wg.Wait()
 	close(errChan)
 
-	// Check for any errors
 	for err := range errChan {
 		if err != nil {
 			return err
@@ -697,10 +568,10 @@ func (c *Converter) compressBitmapsParallel() error {
 	return nil
 }
 
-// flattenNodes flattens the node tree into a list
-// IMPORTANT: Ensures each parent's children are stored contiguously in the array,
-// as required by the NX format (children at indices [firstChild, firstChild+count-1])
+// flattenNodes performs a BFS to lay out nodes contiguously (parent's children
+// at [firstChild, firstChild+count-1]) and builds an index for O(1) lookup.
 func (c *Converter) flattenNodes(root *Node) {
+	c.nodeIndex = make(map[*Node]uint32, 1024*1024)
 	var queue []*Node
 	queue = append(queue, root)
 
@@ -708,33 +579,14 @@ func (c *Converter) flattenNodes(root *Node) {
 		node := queue[0]
 		queue = queue[1:]
 
-		nodeIndex := len(c.nodes)
+		c.nodeIndex[node] = uint32(len(c.nodes))
 		c.nodes = append(c.nodes, node)
 
-		// Log detailed information for portal nodes
-		if node.Name == "portal" || (len(node.Children) > 0 && len(node.Children) <= 20) {
-			c.debugf("Node[%d]: name='%s', children=%d", nodeIndex, node.Name, len(node.Children))
-			for i, child := range node.Children {
-				// Try to extract coordinates if this is a POINT type or has POINT children
-				coords := ""
-				for _, grandchild := range child.Children {
-					if grandchild.Type == NodeTypePOINT {
-						if data, ok := grandchild.Data.([2]int32); ok {
-							coords = fmt.Sprintf(" coords={%d,%d}", data[0], data[1])
-							break
-						}
-					}
-				}
-				c.debugf("  Child[%d]: name='%s'%s", i, child.Name, coords)
-			}
-		}
-
-		// Sort children alphabetically so binary search in the NX reader works correctly.
+		// Sort children alphabetically so binary search in the NX reader works.
 		sort.Slice(node.Children, func(i, j int) bool {
 			return node.Children[i].Name < node.Children[j].Name
 		})
 
-		// Add all children to the queue so they get added contiguously
 		queue = append(queue, node.Children...)
 	}
 }
