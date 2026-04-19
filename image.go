@@ -57,7 +57,8 @@ func (p ARGB4444) R() uint8 { return uint8((p.data >> 8) & 0xF) }
 func (p ARGB4444) G() uint8 { return uint8((p.data >> 4) & 0xF) }
 func (p ARGB4444) B() uint8 { return uint8(p.data & 0xF) }
 
-// processCanvasData converts WZ canvas data to RGBA format
+// processCanvasData converts WZ canvas data to BGRA8888 format,
+// which is the pixel layout expected by NX readers.
 func processCanvasData(canvas *wz.WZCanvas, data []byte) ([]byte, error) {
 	width := int(canvas.Width)
 	height := int(canvas.Height)
@@ -69,9 +70,7 @@ func processCanvasData(canvas *wz.WZCanvas, data []byte) ([]byte, error) {
 	}
 
 	pixels := width * height
-	output := make([]byte, pixels*4) // RGBA
 
-	// Process based on format1
 	var processed []byte
 	var err error
 
@@ -79,90 +78,80 @@ func processCanvasData(canvas *wz.WZCanvas, data []byte) ([]byte, error) {
 	case 1: // ARGB4444
 		processed, err = convertARGB4444(data, width, height)
 
-	case 2: // ARGB8888
+	case 2: // ARGB8888 (stored as BGRA in WZ)
 		processed, err = convertARGB8888(data, width, height)
 
 	case 513: // RGB565
 		processed, err = convertRGB565(data, width, height)
 
 	case 1026: // DXT3
-		// DXT3 decompression would go here
-		// For now, return empty data or the raw data
 		processed = make([]byte, pixels*4)
 
 	case 2050: // DXT5
-		// DXT5 decompression would go here
-		// For now, return empty data or the raw data
 		processed = make([]byte, pixels*4)
 
 	default:
-		// Unknown format, return empty RGBA
-		processed = output
+		processed = make([]byte, pixels*4)
 	}
 
 	if err != nil {
 		return nil, err
 	}
 
-	// Apply format2 scaling if needed
 	if format2 == 4 {
-		// Scale by 16x
 		processed = scaleImage(processed, width, height, 16)
 	}
 
 	return processed, nil
 }
 
-// convertARGB4444 converts ARGB4444 format to RGBA
+// convertARGB4444 converts ARGB4444 format to BGRA8888
 func convertARGB4444(data []byte, width, height int) ([]byte, error) {
 	pixels := width * height
 	output := make([]byte, pixels*4)
 
 	for i := 0; i < pixels && i*2+1 < len(data); i++ {
 		pixel := ARGB4444{binary.LittleEndian.Uint16(data[i*2:])}
-		output[i*4+0] = table4[pixel.R()] // R
+		output[i*4+0] = table4[pixel.B()] // B
 		output[i*4+1] = table4[pixel.G()] // G
-		output[i*4+2] = table4[pixel.B()] // B
+		output[i*4+2] = table4[pixel.R()] // R
 		output[i*4+3] = table4[pixel.A()] // A
 	}
 
 	return output, nil
 }
 
-// convertARGB8888 converts ARGB8888 format to RGBA
+// convertARGB8888 converts ARGB8888/BGRA format to BGRA8888.
+// WZ already stores data as BGRA, so we pass it through unchanged.
 func convertARGB8888(data []byte, width, height int) ([]byte, error) {
 	pixels := width * height
-	output := make([]byte, pixels*4)
-
-	for i := 0; i < pixels && i*4+3 < len(data); i++ {
-		// WZ stores as BGRA, we need RGBA
-		output[i*4+0] = data[i*4+2] // R
-		output[i*4+1] = data[i*4+1] // G
-		output[i*4+2] = data[i*4+0] // B
-		output[i*4+3] = data[i*4+3] // A
+	needed := pixels * 4
+	if len(data) >= needed {
+		return data[:needed], nil
 	}
-
+	// Pad with zeros if source data is shorter than expected
+	output := make([]byte, needed)
+	copy(output, data)
 	return output, nil
 }
 
-// convertRGB565 converts RGB565 format to RGBA
+// convertRGB565 converts RGB565 format to BGRA8888
 func convertRGB565(data []byte, width, height int) ([]byte, error) {
 	pixels := width * height
 	output := make([]byte, pixels*4)
 
 	for i := 0; i < pixels && i*2+1 < len(data); i++ {
 		pixel := RGB565{binary.LittleEndian.Uint16(data[i*2:])}
-		output[i*4+0] = table5[pixel.R()] // R
+		output[i*4+0] = table5[pixel.B()] // B
 		output[i*4+1] = table6[pixel.G()] // G
-		output[i*4+2] = table5[pixel.B()] // B
+		output[i*4+2] = table5[pixel.R()] // R
 		output[i*4+3] = 255               // A (fully opaque)
 	}
 
 	return output, nil
 }
 
-// scaleImage scales an RGBA image by the given factor
-// This is used when format2 == 4 to scale by 16x
+// scaleImage scales a BGRA image by the given factor using nearest neighbor.
 func scaleImage(data []byte, width, height, scale int) []byte {
 	if scale <= 1 || len(data) == 0 {
 		return data

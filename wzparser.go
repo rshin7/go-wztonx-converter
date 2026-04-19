@@ -261,8 +261,10 @@ func (c *Converter) extractCanvasData(canvas *wz.WZCanvas) []byte {
 func (c *Converter) traverseWZSound(sound *wz.WZSoundDX8, parentNode *Node) {
 	audioID := uint32(len(c.audio))
 
-	// Use exported SoundData field directly
-	soundData := sound.SoundData
+	// NX audio entries must include the 82-byte WZ header before the actual
+	// sound data, because readers (e.g. the WASM client) skip the first 82
+	// bytes to reach the playable MP3/WAV payload.
+	soundData := append(sound.HeaderData, sound.SoundData...)
 	length := uint32(len(soundData))
 
 	audio := AudioData{

@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"runtime"
+	"sort"
 	"sync"
 )
 
@@ -541,18 +542,10 @@ func (c *Converter) writeBitmaps(w io.Writer) (uint64, error) {
 		}
 		bitmapOffsets[i] = uint64(pos)
 
-		// Bitmap format:
-		// 2 bytes: width
-		// 2 bytes: height
+		// Bitmap format (matches NoLifeNx C++ reader expectation):
 		// 4 bytes: compressed data size
 		// N bytes: compressed data
-		if err := binary.Write(w, binary.LittleEndian, bitmap.Width); err != nil {
-			return 0, err
-		}
-		if err := binary.Write(w, binary.LittleEndian, bitmap.Height); err != nil {
-			return 0, err
-		}
-		// Write size of compressed data
+		// Width and height are stored in the node data field, not here.
 		if err := binary.Write(w, binary.LittleEndian, uint32(len(bitmap.CompressedData))); err != nil {
 			return 0, err
 		}
@@ -735,6 +728,11 @@ func (c *Converter) flattenNodes(root *Node) {
 				c.debugf("  Child[%d]: name='%s'%s", i, child.Name, coords)
 			}
 		}
+
+		// Sort children alphabetically so binary search in the NX reader works correctly.
+		sort.Slice(node.Children, func(i, j int) bool {
+			return node.Children[i].Name < node.Children[j].Name
+		})
 
 		// Add all children to the queue so they get added contiguously
 		queue = append(queue, node.Children...)

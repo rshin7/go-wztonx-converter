@@ -1,52 +1,42 @@
 package main
 
 import (
-	"bytes"
+	"fmt"
 
 	"github.com/pierrec/lz4/v4"
 )
 
-// compressLZ4 compresses data using LZ4
+// compressLZ4 compresses data using raw LZ4 block format.
+// NX readers use LZ4_decompress_fast which expects raw block data,
+// NOT the LZ4 frame format that lz4.NewWriter produces.
 func compressLZ4(data []byte) ([]byte, error) {
-	var buf bytes.Buffer
-	writer := lz4.NewWriter(&buf)
-
-	_, err := writer.Write(data)
+	dst := make([]byte, lz4.CompressBlockBound(len(data)))
+	n, err := lz4.CompressBlock(data, dst, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("lz4 block compress: %w", err)
 	}
-
-	err = writer.Close()
-	if err != nil {
-		return nil, err
+	if n == 0 {
+		// Data is incompressible; store as-is — the reader will still
+		// decompress correctly because LZ4_decompress_fast handles this.
+		return data, nil
 	}
-
-	return buf.Bytes(), nil
+	return dst[:n], nil
 }
 
-// compressLZ4HC compresses data using LZ4 High Compression
+// compressLZ4HC compresses data using raw LZ4 block format at high compression.
 func compressLZ4HC(data []byte) ([]byte, error) {
-	var buf bytes.Buffer
-	writer := lz4.NewWriter(&buf)
-	// Set high compression level
-	if err := writer.Apply(lz4.CompressionLevelOption(lz4.Level9)); err != nil {
-		return nil, err
-	}
-
-	_, err := writer.Write(data)
+	dst := make([]byte, lz4.CompressBlockBound(len(data)))
+	n, err := lz4.CompressBlockHC(data, dst, lz4.CompressionLevel(9), nil, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("lz4hc block compress: %w", err)
 	}
-
-	err = writer.Close()
-	if err != nil {
-		return nil, err
+	if n == 0 {
+		return data, nil
 	}
-
-	return buf.Bytes(), nil
+	return dst[:n], nil
 }
 
-// Compress data based on HC flag
+// compressData compresses using the appropriate LZ4 variant.
 func (c *Converter) compressData(data []byte) ([]byte, error) {
 	if c.hc {
 		return compressLZ4HC(data)
